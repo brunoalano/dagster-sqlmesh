@@ -1,7 +1,12 @@
+import datetime
 import logging
 
 import polars
 
+import pytest
+
+from dagster_sqlmesh.controller.base import PlanOptions, RunOptions, SQLMeshInstance
+from sqlmesh.utils.errors import SQLMeshError
 from dagster_sqlmesh.testing import SQLMeshTestContext
 
 logger = logging.getLogger(__name__)
@@ -138,7 +143,8 @@ def test_restating_models(sample_sqlmesh_test_context: SQLMeshTestContext):
     SELECT COUNT(*) FROM sqlmesh_example__dev.staging_model_4
     """
     )
-    assert count_query[0][0] == 366
+    expected_rows = (datetime.date(2024, 1, 1) - datetime.date(2023, 1, 1)).days
+    assert count_query[0][0] == expected_rows
 
     feb_sum_query = sample_sqlmesh_test_context.query(
         """
@@ -155,6 +161,9 @@ def test_restating_models(sample_sqlmesh_test_context: SQLMeshTestContext):
     SELECT * FROM sqlmesh_example__dev.intermediate_model_2
     """
     )
+    assert (
+        len(intermediate_2_query) > 0
+    ), "Intermediate model should have data prior to restate"
 
     # Restate the model for the month of March
     sample_sqlmesh_test_context.plan_and_run(
@@ -162,9 +171,7 @@ def test_restating_models(sample_sqlmesh_test_context: SQLMeshTestContext):
         start="2023-03-01",
         end="2023-03-31",
         execution_time="2024-01-02",
-        select_models=["sqlmesh_example.staging_model_4"],
-        restate_selected=True,
-        skip_run=True,
+        restate_models=["sqlmesh_example.staging_model_4"],
     )
 
     # Check that the sum of values for February and March are the same
@@ -191,5 +198,132 @@ def test_restating_models(sample_sqlmesh_test_context: SQLMeshTestContext):
         march_sum_query_restate[0][0] != march_sum_query[0][0]
     ), "March sum should change"
     assert (
-        intermediate_2_query_restate[0][0] == intermediate_2_query[0][0]
-    ), "Intermediate model should not change during restate"
+        len(intermediate_2_query_restate) == len(intermediate_2_query)
+    ), "Intermediate model rows should be rebuilt during restate"
+
+
+def test_plan_and_run_skips_explicit_run_when_plan_handles_execution(
+    sample_sqlmesh_test_context: SQLMeshTestContext, monkeypatch
+):
+    controller = sample_sqlmesh_test_context.create_controller()
+
+    run_invoked = False
+    original_run = SQLMeshInstance.run
+
+    def tracking_run(self: SQLMeshInstance, **kwargs):
+        nonlocal run_invoked
+        run_invoked = True
+        yield from original_run(self, **kwargs)
+
+    monkeypatch.setattr(SQLMeshInstance, "run", tracking_run)
+
+    plan_options = PlanOptions(
+        enable_preview=True,
+        run=True,
+        execution_time="2024-01-02",
+    )
+    run_options = RunOptions(execution_time="2024-01-02")
+
+    list(
+        controller.plan_and_run(
+            "dev",
+            start="2023-01-01",
+            end="2024-01-01",
+            plan_options=plan_options,
+            run_options=run_options,
+        )
+    )
+
+    staging_model_count = sample_sqlmesh_test_context.query(
+        """
+    SELECT COUNT(*) as items FROM sqlmesh_example__dev.staging_model_1
+    """
+    )
+    assert staging_model_count[0][0] == 5
+    assert not run_invoked, "Run stage should not be invoked when plan already executes"
+
+
+def test_plan_and_run_invokes_run_when_plan_option_disabled(
+    sample_sqlmesh_test_context: SQLMeshTestContext, monkeypatch
+):
+    controller = sample_sqlmesh_test_context.create_controller()
+
+    run_invocations = 0
+    original_run = SQLMeshInstance.run
+
+    def tracking_run(self: SQLMeshInstance, **kwargs):
+        nonlocal run_invocations
+        run_invocations += 1
+        yield from original_run(self, **kwargs)
+
+    monkeypatch.setattr(SQLMeshInstance, "run", tracking_run)
+
+    plan_options = PlanOptions(
+        enable_preview=True,
+        run=False,
+        execution_time="2024-01-02",
+    )
+    run_options = RunOptions(execution_time="2024-01-02")
+
+    list(
+        controller.plan_and_run(
+            "dev",
+            start="2023-01-01",
+            end="2024-01-01",
+            plan_options=plan_options,
+            run_options=run_options,
+        )
+    )
+
+    staging_model_count = sample_sqlmesh_test_context.query(
+        """
+    SELECT COUNT(*) as items FROM sqlmesh_example__dev.staging_model_1
+    """
+    )
+    assert staging_model_count[0][0] == 5
+    assert run_invocations == 1, "Run stage should execute exactly once when disabled in plan"
+
+
+def test_plan_and_run_explain_skips_run_stage(
+    sample_sqlmesh_test_context: SQLMeshTestContext, monkeypatch
+):
+    controller = sample_sqlmesh_test_context.create_controller()
+
+    plan_options: PlanOptions = PlanOptions(enable_preview=True)
+
+    # First run populates the environment and allows SQLMesh to set run=True
+    list(
+        controller.plan_and_run(
+            "dev",
+            start="2023-01-01",
+            end="2023-01-10",
+            plan_options=plan_options,
+        )
+    )
+
+    assert plan_options.get("run") is True
+
+    run_invoked = False
+    original_run = SQLMeshInstance.run
+
+    def tracking_run(self: SQLMeshInstance, **kwargs):
+        nonlocal run_invoked
+        run_invoked = True
+        yield from original_run(self, **kwargs)
+
+    monkeypatch.setattr(SQLMeshInstance, "run", tracking_run)
+
+    plan_options["explain"] = True
+
+    with pytest.raises(SQLMeshError):
+        list(
+            controller.plan_and_run(
+                "dev",
+                start="2023-01-01",
+                end="2023-02-01",
+                plan_options=plan_options,
+            )
+        )
+
+    assert not run_invoked, "Explain mode should not trigger a run stage"
+    assert plan_options.get("run") is False

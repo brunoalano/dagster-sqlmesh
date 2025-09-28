@@ -43,9 +43,13 @@ class PlanOptions(t.TypedDict):
     restate_models: t.NotRequired[t.Collection[str]]
     no_gaps: t.NotRequired[bool]
     skip_backfill: t.NotRequired[bool]
+    empty_backfill: t.NotRequired[bool]
     forward_only: t.NotRequired[bool]
     allow_destructive_models: t.NotRequired[t.Collection[str]]
+    allow_additive_models: t.NotRequired[t.Collection[str]]
     no_auto_categorization: t.NotRequired[bool]
+    no_prompts: t.NotRequired[bool]
+    auto_apply: t.NotRequired[bool]
     effective_from: t.NotRequired[TimeLike]
     include_unmodified: t.NotRequired[bool]
     select_models: t.NotRequired[t.Collection[str]]
@@ -53,6 +57,11 @@ class PlanOptions(t.TypedDict):
     categorizer_config: t.NotRequired[CategorizerConfig]
     enable_preview: t.NotRequired[bool]
     run: t.NotRequired[bool]
+    diff_rendered: t.NotRequired[bool]
+    skip_linter: t.NotRequired[bool]
+    explain: t.NotRequired[bool]
+    ignore_cron: t.NotRequired[bool]
+    min_intervals: t.NotRequired[int]
 
 
 class RunOptions(t.TypedDict):
@@ -341,11 +350,25 @@ class SQLMeshInstance(t.Generic[ContextCls]):
             if restate_selected:
                 plan_options["restate_models"] = select_models
         
+        explain_enabled = t.cast(bool, plan_options.get("explain"))
+        if explain_enabled:
+            skip_run = True
+
+        if skip_run:
+            plan_options["run"] = False
+
+        run_during_plan = t.cast(bool, plan_options.get("run", False))
+        if "run" not in plan_options:
+            plan_options["run"] = not skip_run
+            run_during_plan = not skip_run
+        else:
+            run_during_plan = t.cast(bool, plan_options["run"])
+
         try:
             self.logger.debug("starting sqlmesh plan")
             self.logger.debug(f"selected models: {select_models}")
             yield from self.plan(categorizer, default_catalog, **plan_options)
-            if not skip_run:
+            if not skip_run and not run_during_plan:
                 self.logger.debug("starting sqlmesh run")
                 yield from self.run(**run_options)
         except Exception as e:
@@ -538,6 +561,7 @@ class SQLMeshController(t.Generic[ContextCls]):
         *,
         categorizer: SnapshotCategorizer | None = None,
         select_models: list[str] | None = None,
+        restate_models: list[str] | None = None,
         restate_selected: bool = False,
         start: TimeLike | None = None,
         end: TimeLike | None = None,
@@ -551,6 +575,7 @@ class SQLMeshController(t.Generic[ContextCls]):
                 start=start,
                 end=end,
                 select_models=select_models,
+                restate_models=restate_models,
                 restate_selected=restate_selected,
                 categorizer=categorizer,
                 default_catalog=default_catalog,

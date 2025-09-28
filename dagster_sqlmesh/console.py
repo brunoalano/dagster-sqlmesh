@@ -4,14 +4,26 @@ import typing as t
 import unittest
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from sqlglot.expressions import Alter
 from sqlmesh.core.console import Console
 from sqlmesh.core.context_diff import ContextDiff
-from sqlmesh.core.environment import EnvironmentNamingInfo
-from sqlmesh.core.plan import EvaluatablePlan, Plan as SQLMeshPlan, PlanBuilder
-from sqlmesh.core.snapshot import Snapshot, SnapshotChangeCategory, SnapshotInfoLike
+from sqlmesh.core.environment import EnvironmentNamingInfo, EnvironmentSummary
+from sqlmesh.core.linter.rule import RuleViolation
+from sqlmesh.core.model import Model
+from sqlmesh.core.plan import (
+    EvaluatablePlan,
+    Plan as SQLMeshPlan,
+    PlanBuilder,
+    SnapshotIntervals,
+)
+from sqlmesh.core.snapshot import Snapshot, SnapshotChangeCategory, SnapshotId, SnapshotInfoLike
+from sqlmesh.core.snapshot.definition import Interval, Intervals, SnapshotTableInfo
+from sqlmesh.core.snapshot.execution_tracker import QueryExecutionStats
+from sqlmesh.core.state_sync import Versions
 from sqlmesh.core.table_diff import RowDiff, SchemaDiff, TableDiff
+from sqlmesh.core.config.connection import ConnectionConfig
 from sqlmesh.utils.concurrency import NodeExecutionFailedError
 
 logger = logging.getLogger(__name__)
@@ -42,19 +54,27 @@ class StopPlanEvaluation(BaseConsoleEvent):
 
 @dataclass(kw_only=True)
 class StartEvaluationProgress(BaseConsoleEvent):
-    batched_intervals: dict[Snapshot, int]
+    batched_intervals: dict[Snapshot, Intervals]
     environment_naming_info: EnvironmentNamingInfo
     default_catalog: str | None
+    audit_only: bool = False
 
 @dataclass(kw_only=True)
 class StartSnapshotEvaluationProgress(BaseConsoleEvent):
     snapshot: Snapshot
+    audit_only: bool = False
 
 @dataclass(kw_only=True)
 class UpdateSnapshotEvaluationProgress(BaseConsoleEvent):
     snapshot: Snapshot
+    interval: Interval
     batch_idx: int
     duration_ms: int | None
+    num_audits_passed: int
+    num_audits_failed: int
+    audit_only: bool = False
+    execution_stats: QueryExecutionStats | None = None
+    auto_restatement_triggers: list[SnapshotId] | None = None
 
 @dataclass(kw_only=True)
 class StopEvaluationProgress(BaseConsoleEvent):
@@ -88,7 +108,7 @@ class StopCleanup(BaseConsoleEvent):
 
 @dataclass(kw_only=True)
 class StartPromotionProgress(BaseConsoleEvent):
-    total_tasks: int
+    snapshots: list[SnapshotTableInfo]
     environment_naming_info: EnvironmentNamingInfo
     default_catalog: str | None
 
@@ -100,6 +120,19 @@ class UpdatePromotionProgress(BaseConsoleEvent):
 @dataclass(kw_only=True)
 class StopPromotionProgress(BaseConsoleEvent):
     success: bool = True
+
+@dataclass(kw_only=True)
+class LogAdditiveChange(BaseConsoleEvent):
+    snapshot_name: str
+    alter_operations: list[Alter]
+    dialect: str
+    error: bool = True
+
+@dataclass(kw_only=True)
+class LogModelsUpdatedDuringRestatement(BaseConsoleEvent):
+    snapshots: list[tuple[SnapshotTableInfo, SnapshotTableInfo]]
+    environment_naming_info: EnvironmentNamingInfo
+    default_catalog: str | None
 
 @dataclass(kw_only=True)
 class UpdateSnapshotMigrationProgress(BaseConsoleEvent):
@@ -115,6 +148,16 @@ class StartSnapshotMigrationProgress(BaseConsoleEvent):
 
 @dataclass(kw_only=True)
 class StopSnapshotMigrationProgress(BaseConsoleEvent):
+    success: bool = True
+
+@dataclass(kw_only=True)
+class StartDestroy(BaseConsoleEvent):
+    schemas_to_delete: set[str] | None = None
+    views_to_delete: set[str] | None = None
+    tables_to_delete: set[str] | None = None
+
+@dataclass(kw_only=True)
+class StopDestroy(BaseConsoleEvent):
     success: bool = True
 
 @dataclass(kw_only=True)
@@ -137,12 +180,28 @@ class ShowModelDifferenceSummary(BaseConsoleEvent):
     no_diff: bool = True
 
 @dataclass(kw_only=True)
+class ShowEnvironmentDifferenceSummary(BaseConsoleEvent):
+    context_diff: ContextDiff
+    no_diff: bool = True
+
+@dataclass(kw_only=True)
+class ShowIntervals(BaseConsoleEvent):
+    snapshot_intervals: dict[Snapshot, SnapshotIntervals]
+
+@dataclass(kw_only=True)
+class ShowLinterViolations(BaseConsoleEvent):
+    violations: list[RuleViolation]
+    model: Model
+    is_error: bool = False
+
+@dataclass(kw_only=True)
 class Plan(BaseConsoleEvent):
     plan_builder: PlanBuilder
     auto_apply: bool
     default_catalog: str | None
     no_diff: bool = False
     no_prompts: bool = False
+    diff_rendered: bool = False
 
 @dataclass(kw_only=True)
 class LogTestResults(BaseConsoleEvent):
@@ -154,6 +213,17 @@ class LogTestResults(BaseConsoleEvent):
 @dataclass(kw_only=True)
 class ShowSQL(BaseConsoleEvent):
     sql: str
+
+@dataclass(kw_only=True)
+class ShowTableDiff(BaseConsoleEvent):
+    table_diffs: list[TableDiff]
+    show_sample: bool = True
+    skip_grain_check: bool = False
+    temp_schema: str | None = None
+
+@dataclass(kw_only=True)
+class ShowTableDiffDetails(BaseConsoleEvent):
+    models_to_diff: list[str]
 
 @dataclass(kw_only=True)
 class LogStatusUpdate(BaseConsoleEvent):
@@ -220,6 +290,88 @@ class ShowTableDiffSummary(BaseConsoleEvent):
     table_diff: TableDiff
 
 @dataclass(kw_only=True)
+class StartSignalProgress(BaseConsoleEvent):
+    snapshot: Snapshot
+    default_catalog: str | None
+    environment_naming_info: EnvironmentNamingInfo
+
+@dataclass(kw_only=True)
+class UpdateSignalProgress(BaseConsoleEvent):
+    snapshot: Snapshot
+    signal_name: str
+    signal_idx: int
+    total_signals: int
+    ready_intervals: Intervals
+    check_intervals: Intervals
+    duration: float
+
+@dataclass(kw_only=True)
+class StopSignalProgress(BaseConsoleEvent):
+    pass
+
+@dataclass(kw_only=True)
+class StartStateExport(BaseConsoleEvent):
+    output_file: Path
+    gateway: str | None = None
+    state_connection_config: ConnectionConfig | None = None
+    environment_names: list[str] | None = None
+    local_only: bool = False
+    confirm: bool = True
+
+@dataclass(kw_only=True)
+class UpdateStateExportProgress(BaseConsoleEvent):
+    version_count: int | None = None
+    versions_complete: bool = False
+    snapshot_count: int | None = None
+    snapshots_complete: bool = False
+    environment_count: int | None = None
+    environments_complete: bool = False
+
+@dataclass(kw_only=True)
+class StopStateExport(BaseConsoleEvent):
+    success: bool
+    output_file: Path
+
+@dataclass(kw_only=True)
+class StartStateImport(BaseConsoleEvent):
+    input_file: Path
+    gateway: str
+    state_connection_config: ConnectionConfig
+    clear: bool = False
+    confirm: bool = True
+
+@dataclass(kw_only=True)
+class UpdateStateImportProgress(BaseConsoleEvent):
+    timestamp: str | None = None
+    state_file_version: int | None = None
+    versions: Versions | None = None
+    snapshot_count: int | None = None
+    snapshots_complete: bool = False
+    environment_count: int | None = None
+    environments_complete: bool = False
+
+@dataclass(kw_only=True)
+class StopStateImport(BaseConsoleEvent):
+    success: bool
+    input_file: Path
+
+@dataclass(kw_only=True)
+class StartTableDiffModelProgress(BaseConsoleEvent):
+    model: str
+
+@dataclass(kw_only=True)
+class StartTableDiffProgress(BaseConsoleEvent):
+    models_to_diff: int
+
+@dataclass(kw_only=True)
+class UpdateTableDiffProgress(BaseConsoleEvent):
+    model: str
+
+@dataclass(kw_only=True)
+class StopTableDiffProgress(BaseConsoleEvent):
+    success: bool
+
+@dataclass(kw_only=True)
 class PlanBuilt(BaseConsoleEvent):
     plan: SQLMeshPlan
 
@@ -236,19 +388,28 @@ ConsoleEvent = (
     | StartCleanup
     | UpdateCleanupProgress
     | StopCleanup
-    #| StartPromotionProgress
+    | StartPromotionProgress
     | UpdatePromotionProgress
     | StopPromotionProgress
+    | LogAdditiveChange
+    | LogModelsUpdatedDuringRestatement
     | UpdateSnapshotMigrationProgress
     | LogMigrationStatus
     | StopSnapshotMigrationProgress
+    | StartDestroy
+    | StopDestroy
     | StartEnvMigrationProgress
     | UpdateEnvMigrationProgress
     | StopEnvMigrationProgress
     | ShowModelDifferenceSummary
+    | ShowEnvironmentDifferenceSummary
+    | ShowIntervals
+    | ShowLinterViolations
     | Plan
     | LogTestResults
     | ShowSQL
+    | ShowTableDiff
+    | ShowTableDiffDetails
     | LogStatusUpdate
     | LogError
     | LogWarning
@@ -260,6 +421,15 @@ ConsoleEvent = (
     | LoadingStop
     | ShowSchemaDiff
     | ShowRowDiff
+    | StartSignalProgress
+    | UpdateSignalProgress
+    | StopSignalProgress
+    | StartStateExport
+    | UpdateStateExportProgress
+    | StopStateExport
+    | StartStateImport
+    | UpdateStateImportProgress
+    | StopStateImport
     | StartMigrationProgress
     | UpdateMigrationProgress
     | StopMigrationProgress
@@ -267,6 +437,10 @@ ConsoleEvent = (
     | ConsoleException
     | PrintEnvironments
     | ShowTableDiffSummary
+    | StartTableDiffModelProgress
+    | StartTableDiffProgress
+    | UpdateTableDiffProgress
+    | StopTableDiffProgress
     | PlanBuilt
 )
 
@@ -439,27 +613,26 @@ class GeneratedCallable(t.Generic[EventType]):
         self.original_signature = original_signature
         self.method_name = method_name
 
-    def __call__(self, *args: t.Any, **kwargs: t.Any) -> None:
+    def __call__(self, *args: t.Any, **kwargs: t.Any) -> t.Any:
         """Create an instance of the event class with the provided arguments."""
         # Bind arguments to the original signature
         try:
-            bound = self.original_signature.bind(*args, **kwargs)
+            bound = self.original_signature.bind(self.console, *args, **kwargs)
             bound.apply_defaults()
         except TypeError as e:
             # If binding fails, collect all args/kwargs as unknown
             self.console.logger.warning(f"Failed to bind arguments for {self.method_name}: {e}")
-            unknown_args = {str(i): arg for i, arg in enumerate(args[1:])}  # Skip 'self'
+            unknown_args = {str(i): arg for i, arg in enumerate(args)}
             unknown_args.update(kwargs)
-            self._create_and_publish_event({}, unknown_args)
-            return
+            return self._create_and_publish_event({}, unknown_args)
 
         # Process bound arguments
         bound_args = dict(bound.arguments)
         bound_args.pop("self", None)  # Remove self from arguments
 
-        self._create_and_publish_event(bound_args, {})
+        return self._create_and_publish_event(bound_args, {})
 
-    def _create_and_publish_event(self, bound_args: dict[str, t.Any], extra_unknown: dict[str, t.Any]) -> None:
+    def _create_and_publish_event(self, bound_args: dict[str, t.Any], extra_unknown: dict[str, t.Any]) -> t.Any:
         """Create and publish the event with proper argument handling."""
         expected_fields = self.event_cls.__dataclass_fields__
         expected_kwargs: dict[str, t.Any] = {}
@@ -478,6 +651,18 @@ class GeneratedCallable(t.Generic[EventType]):
         # Create and publish the event
         event = self.event_cls(**expected_kwargs, unknown_args=unknown_args)
         self.console.publish(t.cast(ConsoleEvent, event))
+        return self._resolve_return_value(event)
+
+    def _resolve_return_value(self, event: EventType) -> t.Any:
+        annotation = self.original_signature.return_annotation
+
+        if annotation in (inspect.Signature.empty, None, "None"):
+            return None
+        if annotation in (bool, "bool"):
+            return True
+        if annotation in (uuid.UUID, "uuid.UUID"):
+            return getattr(event, "id", uuid.uuid4())
+        return None
 
 
 class UnknownEventCallable:
@@ -497,13 +682,13 @@ class UnknownEventCallable:
         """Handle unknown event method calls."""
         # Bind arguments to the original signature
         try:
-            bound = self.original_signature.bind(*args, **kwargs)
+            bound = self.original_signature.bind(self.console, *args, **kwargs)
             bound.apply_defaults()
             bound_args = dict(bound.arguments)
             bound_args.pop("self", None)  # Remove self from arguments
         except TypeError:
             # If binding fails, collect all args/kwargs
-            bound_args = {str(i): arg for i, arg in enumerate(args[1:])}  # Skip 'self'
+            bound_args = {str(i): arg for i, arg in enumerate(args)}
             bound_args.update(kwargs)
 
         self.console.publish_unknown_event(self.method_name, **bound_args)
@@ -524,26 +709,7 @@ class EventConsole(IntrospectingConsole):
 
     categorizer: SnapshotCategorizer | None = None
 
-    events: t.ClassVar[list[type[ConsoleEvent]]] = [
-        Plan,
-        StartPlanEvaluation,
-        StopPlanEvaluation,
-        StartEvaluationProgress,
-        StopEvaluationProgress,
-        UpdatePromotionProgress,
-        StopPromotionProgress,
-        StartSnapshotEvaluationProgress,
-        UpdateSnapshotEvaluationProgress,
-        LogError,
-        LogWarning,
-        LogSuccess,
-        LogFailedModels,
-        LogSkippedModels,
-        LogTestResults,
-        ConsoleException,
-        PrintEnvironments,
-        ShowTableDiffSummary,
-    ]
+    events: t.ClassVar[list[type[ConsoleEvent]]] = list(t.get_args(ConsoleEvent))
 
     def exception(self, exc: Exception) -> None:
         self.publish(ConsoleException(exception=exc))

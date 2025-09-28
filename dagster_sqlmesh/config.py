@@ -39,6 +39,9 @@ class SQLMeshContextConfig(Config):
         default="dagster_sqlmesh.translator.SQLMeshDagsterTranslator",
         description="Fully qualified class name of the SQLMesh Dagster translator to use"
     )
+    virtual_environment_mode: str | None = Field(default=None)
+    environment_catalog_mapping: dict[str, str] | None = Field(default=None)
+    default_target_environment: str | None = Field(default=None)
     
     def get_translator(self) -> "SQLMeshDagsterTranslator":
         """Get a translator instance using the configured class name.
@@ -80,9 +83,21 @@ class SQLMeshContextConfig(Config):
     @property
     def sqlmesh_config(self) -> MeshConfig:
         if self.config_override:
-            return MeshConfig.parse_obj(self.config_override)
-        sqlmesh_path = Path(self.path)
-        configs = load_configs(None, MeshConfig, [sqlmesh_path])
-        if sqlmesh_path not in configs:
-            raise ValueError(f"SQLMesh configuration not found at {sqlmesh_path}")
-        return configs[sqlmesh_path]
+            base_config = MeshConfig.parse_obj(self.config_override)
+        else:
+            sqlmesh_path = Path(self.path)
+            configs = load_configs(None, MeshConfig, [sqlmesh_path])
+            if sqlmesh_path not in configs:
+                raise ValueError(f"SQLMesh configuration not found at {sqlmesh_path}")
+            base_config = configs[sqlmesh_path]
+
+        config_dict = base_config.dict()
+
+        if self.virtual_environment_mode is not None:
+            config_dict["virtual_environment_mode"] = self.virtual_environment_mode
+        if self.environment_catalog_mapping is not None:
+            config_dict["environment_catalog_mapping"] = self.environment_catalog_mapping
+        if self.default_target_environment is not None:
+            config_dict["default_target_environment"] = self.default_target_environment
+
+        return MeshConfig.parse_obj(config_dict)

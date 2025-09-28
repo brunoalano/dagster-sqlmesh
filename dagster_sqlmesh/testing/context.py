@@ -145,6 +145,7 @@ class SQLMeshTestContext:
         start: TimeLike | None = None,
         end: TimeLike | None = None,
         select_models: list[str] | None = None,
+        restate_models: list[str] | None = None,
         restate_selected: bool = False,
         skip_run: bool = False,
     ):
@@ -181,6 +182,7 @@ class SQLMeshTestContext:
             start=start,
             end=end,
             select_models=select_models,
+            restate_models=restate_models,
             restate_selected=restate_selected,
             plan_options=plan_options,
             run_options=run_options,

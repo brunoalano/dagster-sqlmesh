@@ -4,6 +4,7 @@ import shutil
 import sys
 import tempfile
 import typing as t
+import warnings
 
 import pytest
 
@@ -22,6 +23,26 @@ def setup_debug_logging_for_tests() -> None:
     root_logger.setLevel(logging.DEBUG)
 
     logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
+    warnings.filterwarnings(
+        "ignore",
+        message="The argument 'infer_datetime_format' is deprecated",
+        category=UserWarning,
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message="errors='ignore' is deprecated",
+        category=FutureWarning,
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message="Support for class-based `config` is deprecated",
+        category=DeprecationWarning,
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r"This process .* is multi-threaded, use of fork\(\) may lead to deadlocks",
+        category=DeprecationWarning,
+    )
 
 
 @pytest.fixture

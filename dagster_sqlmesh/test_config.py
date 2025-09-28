@@ -2,6 +2,8 @@ import pytest
 
 from dagster_sqlmesh.config import SQLMeshContextConfig
 from dagster_sqlmesh.translator import SQLMeshDagsterTranslator
+from sqlmesh.core.config import Config as MeshConfig, GatewayConfig, ModelDefaultsConfig
+from sqlmesh.core.config.connection import DuckDBConnectionConfig
 
 
 def test_get_translator_with_valid_class():
@@ -63,3 +65,32 @@ def test_get_translator_with_valid_custom_class():
     translator = config.get_translator()
     assert isinstance(translator, SQLMeshDagsterTranslator)
     assert isinstance(translator, MockValidTranslator)
+
+
+def test_sqlmesh_config_applies_virtual_env_and_catalog_overrides(tmp_path):
+    base_config = MeshConfig(
+        gateways={
+            "local": GatewayConfig(connection=DuckDBConnectionConfig(database=str(tmp_path / "db.db"))),
+        },
+        default_gateway="local",
+        model_defaults=ModelDefaultsConfig(dialect="duckdb"),
+    )
+
+    context_config = SQLMeshContextConfig(
+        path=str(tmp_path),
+        gateway="local",
+        config_override=base_config.dict(),
+        virtual_environment_mode="dev_only",
+        environment_catalog_mapping={"dev": "DEV_CATALOG"},
+        default_target_environment="prod",
+    )
+
+    mesh_config = context_config.sqlmesh_config
+
+    assert mesh_config.virtual_environment_mode == "dev_only"
+    mapping = mesh_config.environment_catalog_mapping
+    assert mapping
+    key = next(iter(mapping))
+    assert getattr(key, "pattern", key) == "dev"
+    assert next(iter(mapping.values())) == "dev_catalog"
+    assert mesh_config.default_target_environment == "prod"

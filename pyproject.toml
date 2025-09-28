@@ -9,8 +9,8 @@ license = {text = "Apache-2.0"}
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
 dependencies = [
-    "dagster>=1.7.8",
-    "sqlmesh>=0.188",
+    "dagster>=1.11.12",
+    "sqlmesh>=0.223.0",
     "pytest>=8.3.2",
     "pyarrow>=18.0.0",
     "pydantic>=2.11.5",
@@ -20,10 +20,10 @@ dependencies = [
 dev = [
     "ipython>=8.26.0",
     "pdbpp>=0.10.3",
-    "dagster-webserver>=1.8.1",
+    "dagster-webserver>=1.11.12",
     "ruff==0.10.0",
-    "polars>=1.5.0",
-    "dagster-duckdb-polars>=0.24.2",
+    "polars>=1.33.1",
+    "dagster-duckdb-polars>=0.27.12",
     "fastapi", # this is for sqlmesh ui
     "sse-starlette",
 ]

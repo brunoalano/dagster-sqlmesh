@@ -1,4 +1,5 @@
 import logging
+import threading
 import typing as t
 from datetime import UTC, datetime
 from types import MappingProxyType
@@ -12,6 +13,8 @@ from sqlmesh import Model
 from sqlmesh.core.context import Context as SQLMeshContext
 from sqlmesh.core.plan import Plan as SQLMeshPlan
 from sqlmesh.core.snapshot import Snapshot, SnapshotInfoLike
+from sqlmesh.core.snapshot.definition import Intervals
+from sqlmesh.core.table_diff import TableDiff
 from sqlmesh.utils.dag import DAG
 from sqlmesh.utils.date import TimeLike
 from sqlmesh.utils.errors import SQLMeshError
@@ -25,6 +28,7 @@ from dagster_sqlmesh.controller.base import (
     ContextFactory,
 )
 from dagster_sqlmesh.controller.dagster import DagsterSQLMeshController
+from dagster_sqlmesh.events import ConsoleGenerator
 
 if t.TYPE_CHECKING:
     from dagster_sqlmesh.translator import SQLMeshDagsterTranslator
@@ -222,11 +226,17 @@ class MaterializationTracker:
     def stop_promotion(self) -> None:
         self.finished_promotion = True
 
-    def plan(self, batches: dict[Snapshot, int]) -> None:
-        self._batches = batches
-        self._count: dict[Snapshot, int] = {}
+    def plan(self, batches: dict[Snapshot, Intervals]) -> None:
+        self._batches = {}
+        self._count = {}
 
-        for snapshot, _ in self._batches.items():
+        for snapshot, intervals in batches.items():
+            if hasattr(intervals, "__len__"):
+                expected = len(intervals)  # type: ignore[arg-type]
+            else:
+                raw_intervals = getattr(intervals, "intervals", [])
+                expected = len(list(raw_intervals))
+            self._batches[snapshot] = expected
             self._count[snapshot] = 0
             self._model_metadata[snapshot.name].backfill_now()
 
@@ -473,6 +483,7 @@ class DagsterSQLMeshEventHandler:
                 batched_intervals=batches,
                 environment_naming_info=environment_naming_info,
                 default_catalog=default_catalog,
+                audit_only=audit_only,
             ):
                 self.update_stage("run")
                 log_context.info(
@@ -480,15 +491,24 @@ class DagsterSQLMeshEventHandler:
                     {
                         "default_catalog": default_catalog,
                         "environment_naming_info": environment_naming_info,
+                        "audit_only": audit_only,
                         "backfill_queue": {
-                            snapshot.model.name: count
-                            for snapshot, count in batches.items()
+                            snapshot.model.name: len(intervals)
+                            for snapshot, intervals in batches.items()
                         },
                     },
                 )
                 self._tracker.plan(batches)
             case console.UpdateSnapshotEvaluationProgress(
-                snapshot=snapshot, batch_idx=batch_idx, duration_ms=duration_ms
+                snapshot=snapshot,
+                interval=interval,
+                batch_idx=batch_idx,
+                duration_ms=duration_ms,
+                num_audits_passed=num_audits_passed,
+                num_audits_failed=num_audits_failed,
+                audit_only=audit_only,
+                execution_stats=execution_stats,
+                auto_restatement_triggers=auto_restatement_triggers,
             ):
                 done, expected = self._tracker.update_plan(snapshot, batch_idx)
 
@@ -507,6 +527,15 @@ class DagsterSQLMeshEventHandler:
                             "asset_key": self._translator.get_asset_key_str(snapshot.model.name),
                             "progress": f"{done}/{expected}",
                             "duration_ms": duration_ms,
+                            "interval": {
+                                "start": interval.start,
+                                "end": interval.end,
+                            },
+                            "audit_only": audit_only,
+                            "audits_passed": num_audits_passed,
+                            "audits_failed": num_audits_failed,
+                            "execution_stats": execution_stats,
+                            "auto_restatement_triggers": auto_restatement_triggers,
                         },
                     )
             case console.LogSuccess(success=success):
@@ -530,6 +559,79 @@ class DagsterSQLMeshEventHandler:
                         self._errors.append(
                             FailedModelError(error.node, str(error.__cause__))
                         )
+            case console.LogAdditiveChange(
+                snapshot_name=snapshot_name,
+                alter_operations=alter_operations,
+                dialect=dialect,
+                error=error,
+            ):
+                log_context.info(
+                    "Additive change detected",
+                    {
+                        "snapshot": snapshot_name,
+                        "dialect": dialect,
+                        "operations": [str(op) for op in alter_operations],
+                        "error": error,
+                    },
+                )
+            case console.LogModelsUpdatedDuringRestatement(
+                snapshots=snapshots,
+                environment_naming_info=environment_naming_info,
+                default_catalog=default_catalog,
+            ):
+                log_context.info(
+                    "Models updated during restatement",
+                    {
+                        "snapshots": [
+                            {
+                                "from": previous.name,
+                                "to": current.name,
+                            }
+                            for current, previous in snapshots
+                        ],
+                        "environment_naming_info": environment_naming_info,
+                        "default_catalog": default_catalog,
+                    },
+                )
+            case console.ShowEnvironmentDifferenceSummary(
+                context_diff=context_diff, no_diff=no_diff
+            ):
+                log_context.info(
+                    "Environment difference summary",
+                    {
+                        "no_diff": no_diff,
+                        "added": list(context_diff.added),
+                        "removed": list(context_diff.removed_snapshots.keys()),
+                        "modified": list(context_diff.modified_snapshots.keys()),
+                    },
+                )
+            case console.ShowIntervals(snapshot_intervals=snapshot_intervals):
+                log_context.info(
+                    "Snapshot intervals",
+                    {
+                        "snapshots": {
+                            snapshot.name: [
+                                {
+                                    "start": interval.start,
+                                    "end": interval.end,
+                                }
+                                for interval in intervals
+                            ]
+                            for snapshot, intervals in snapshot_intervals.items()
+                        }
+                    },
+                )
+            case console.ShowLinterViolations(
+                violations=violations, model=model, is_error=is_error
+            ):
+                log_context.warning(
+                    "Linter violations reported",
+                    {
+                        "model": model.fqn if model else None,
+                        "count": len(violations),
+                        "severity": "error" if is_error else "warning",
+                    },
+                )
             case console.UpdatePromotionProgress(snapshot=snapshot, promoted=promoted):
                 log_context.info(
                     "Promotion progress update",
@@ -545,6 +647,192 @@ class DagsterSQLMeshEventHandler:
                     log_context.info("Promotion completed successfully")
                 else:
                     log_context.error("Promotion failed")
+            case console.StartDestroy(
+                schemas_to_delete=schemas,
+                views_to_delete=views,
+                tables_to_delete=tables,
+            ):
+                log_context.info(
+                    "Destroy operation started",
+                    {
+                        "schemas": sorted(schemas or []),
+                        "views": sorted(views or []),
+                        "tables": sorted(tables or []),
+                    },
+                )
+            case console.StopDestroy(success=success):
+                if success:
+                    log_context.info("Destroy operation completed")
+                else:
+                    log_context.error("Destroy operation failed")
+            case console.ShowTableDiff(table_diffs=table_diffs) as diff_event:
+                log_context.info(
+                    "Table diff results",
+                    {
+                        "models": [diff.model_name for diff in table_diffs],
+                        "options": {
+                            "show_sample": diff_event.show_sample,
+                            "skip_grain_check": diff_event.skip_grain_check,
+                            "temp_schema": diff_event.temp_schema,
+                        },
+                    },
+                )
+            case console.ShowTableDiffDetails(models_to_diff=models_to_diff):
+                log_context.info(
+                    "Table diff model details",
+                    {
+                        "models": models_to_diff,
+                    },
+                )
+            case console.StartSignalProgress(
+                snapshot=snapshot,
+                default_catalog=default_catalog,
+                environment_naming_info=environment_naming_info,
+            ):
+                log_context.info(
+                    "Signal evaluation started",
+                    {
+                        "snapshot": snapshot.name,
+                        "default_catalog": default_catalog,
+                        "environment_naming_info": environment_naming_info,
+                    },
+                )
+            case console.UpdateSignalProgress(
+                snapshot=snapshot,
+                signal_name=signal_name,
+                signal_idx=signal_idx,
+                total_signals=total_signals,
+                ready_intervals=ready_intervals,
+                check_intervals=check_intervals,
+                duration=duration,
+            ):
+                log_context.info(
+                    "Signal progress update",
+                    {
+                        "snapshot": snapshot.name,
+                        "signal_name": signal_name,
+                        "position": f"{signal_idx}/{total_signals}",
+                        "ready_intervals": [
+                            {
+                                "start": interval.start,
+                                "end": interval.end,
+                            }
+                            for interval in ready_intervals
+                        ],
+                        "check_intervals": [
+                            {
+                                "start": interval.start,
+                                "end": interval.end,
+                            }
+                            for interval in check_intervals
+                        ],
+                        "duration": duration,
+                    },
+                )
+            case console.StopSignalProgress():
+                log_context.info("Signal evaluation finished")
+            case console.StartStateExport(
+                output_file=output_file,
+                gateway=gateway,
+                state_connection_config=state_connection_config,
+                environment_names=environment_names,
+                local_only=local_only,
+                confirm=confirm,
+            ):
+                log_context.info(
+                    "State export started",
+                    {
+                        "output_file": str(output_file),
+                        "gateway": gateway,
+                        "environment_names": environment_names,
+                        "local_only": local_only,
+                        "confirm": confirm,
+                        "state_connection_config": state_connection_config,
+                    },
+                )
+            case console.UpdateStateExportProgress(
+                version_count=version_count,
+                versions_complete=versions_complete,
+                snapshot_count=snapshot_count,
+                snapshots_complete=snapshots_complete,
+                environment_count=environment_count,
+                environments_complete=environments_complete,
+            ):
+                log_context.info(
+                    "State export progress",
+                    {
+                        "version_count": version_count,
+                        "versions_complete": versions_complete,
+                        "snapshot_count": snapshot_count,
+                        "snapshots_complete": snapshots_complete,
+                        "environment_count": environment_count,
+                        "environments_complete": environments_complete,
+                    },
+                )
+            case console.StopStateExport(success=success, output_file=output_file):
+                message = "State export completed" if success else "State export failed"
+                log_context.info(message, {"output_file": str(output_file), "success": success})
+            case console.StartStateImport(
+                input_file=input_file,
+                gateway=gateway,
+                state_connection_config=state_connection_config,
+                clear=clear,
+                confirm=confirm,
+            ):
+                log_context.info(
+                    "State import started",
+                    {
+                        "input_file": str(input_file),
+                        "gateway": gateway,
+                        "clear": clear,
+                        "confirm": confirm,
+                        "state_connection_config": state_connection_config,
+                    },
+                )
+            case console.UpdateStateImportProgress(
+                timestamp=timestamp,
+                state_file_version=state_file_version,
+                versions=versions,
+                snapshot_count=snapshot_count,
+                snapshots_complete=snapshots_complete,
+                environment_count=environment_count,
+                environments_complete=environments_complete,
+            ):
+                log_context.info(
+                    "State import progress",
+                    {
+                        "timestamp": timestamp,
+                        "state_file_version": state_file_version,
+                        "versions": versions,
+                        "snapshot_count": snapshot_count,
+                        "snapshots_complete": snapshots_complete,
+                        "environment_count": environment_count,
+                        "environments_complete": environments_complete,
+                    },
+                )
+            case console.StopStateImport(success=success, input_file=input_file):
+                message = "State import completed" if success else "State import failed"
+                log_context.info(message, {"input_file": str(input_file), "success": success})
+            case console.StartTableDiffModelProgress(model=model_name):
+                log_context.info(
+                    "Table diff model progress started",
+                    {"model": model_name},
+                )
+            case console.StartTableDiffProgress(models_to_diff=models_to_diff):
+                log_context.info(
+                    "Table diff progress started",
+                    {"models_to_diff": models_to_diff},
+                )
+            case console.UpdateTableDiffProgress(model=model_name):
+                log_context.info(
+                    "Table diff progress update",
+                    {"model": model_name},
+                )
+            case console.StopTableDiffProgress(success=success):
+                if success:
+                    log_context.info("Table diff completed")
+                else:
+                    log_context.error("Table diff failed")
             case _:
                 log_context.debug("Received event")
 
@@ -577,6 +865,72 @@ class DagsterSQLMeshEventHandler:
     @property
     def errors(self) -> list[Exception]:
         return self._errors[:]
+
+
+class TableDiffEventHandler:
+    """Lightweight handler for SQLMesh table diff console events."""
+
+    def __init__(self, context: dg.AssetExecutionContext):
+        self._context = context
+
+    def process_events(self, event: console.ConsoleEvent) -> None:
+        log = self._context.log
+
+        match event:
+            case console.ShowTableDiff(table_diffs=table_diffs) as diff_event:
+                log.info(
+                    "SQLMesh table diff results",
+                    {
+                        "models": [getattr(diff, "source_schema", str(diff)) for diff in table_diffs],
+                        "options": {
+                            "show_sample": diff_event.show_sample,
+                            "skip_grain_check": diff_event.skip_grain_check,
+                            "temp_schema": diff_event.temp_schema,
+                        },
+                    },
+                )
+            case console.ShowTableDiffDetails(models_to_diff=models_to_diff):
+                log.info("SQLMesh table diff details", {"models": models_to_diff})
+            case console.ShowTableDiffSummary(table_diff=table_diff):
+                log.info(
+                    "SQLMesh table diff summary",
+                    {
+                        "source_schema": getattr(table_diff, "source_schema", None),
+                        "target_schema": getattr(table_diff, "target_schema", None),
+                        "row_diff": str(getattr(table_diff, "row_diff", "")),
+                        "schema_diff": str(getattr(table_diff, "schema_diff", "")),
+                    },
+                )
+            case console.StartTableDiffModelProgress(model=model):
+                log.info("Starting table diff for model", {"model": model})
+            case console.StartTableDiffProgress(models_to_diff=models_to_diff):
+                log.info("Table diff progress started", {"models_to_diff": models_to_diff})
+            case console.UpdateTableDiffProgress(model=model):
+                log.info("Table diff progress update", {"model": model})
+            case console.StopTableDiffProgress(success=success):
+                if success:
+                    log.info("Table diff completed successfully")
+                else:
+                    log.error("Table diff failed")
+            case console.LogStatusUpdate(message=message):
+                log.info(message)
+            case console.LogWarning(short_message=short_message, long_message=long_message):
+                detail = f"{short_message}: {long_message}" if long_message else short_message
+                log.warning(detail)
+            case console.LogError(message=message):
+                log.error(message)
+            case console.LoadingStart(id=load_id, message=message):
+                log.debug(
+                    "SQLMesh loading start",
+                    {"message": message, "id": str(load_id)},
+                )
+            case console.LoadingStop(id=load_id):
+                log.debug("SQLMesh loading stop", {"id": str(load_id)})
+            case _:
+                log.debug(
+                    "Unhandled SQLMesh table diff event",
+                    {"event": event.__class__.__name__},
+                )
 
 
 class SQLMeshResource(dg.ConfigurableResource):
@@ -681,6 +1035,63 @@ class SQLMeshResource(dg.ConfigurableResource):
             yield from event_handler.notify_success(mesh.context)
 
             logger.debug("sqlmesh selected all models notified of completion")
+
+    def table_diff(
+        self,
+        context: dg.AssetExecutionContext,
+        *,
+        source: str,
+        target: str,
+        context_factory: ContextFactory[ContextCls] = DEFAULT_CONTEXT_FACTORY,
+        environment: str = "dev",
+        **table_diff_kwargs: t.Any,
+    ) -> list[TableDiff]:
+        """Execute SQLMesh table diff and emit console telemetry through Dagster logs."""
+
+        table_diff_kwargs.setdefault("show", True)
+
+        controller = self.get_controller(
+            context_factory=context_factory, log_override=context.log
+        )
+
+        with controller.instance(environment, "table_diff") as mesh:
+            diffs: list[TableDiff] = []
+            errors: list[Exception] = []
+            event_handler = TableDiffEventHandler(context)
+            generator = ConsoleGenerator(context.log)
+
+            def run_table_diff() -> None:
+                try:
+                    result = mesh.context.table_diff(source, target, **table_diff_kwargs)
+                    diffs.extend(result)
+                except Exception as exc:  # pragma: no cover
+                    errors.append(exc)
+                    mesh.console.exception(exc)
+
+            with mesh.console_context(generator):
+                thread = threading.Thread(
+                    target=run_table_diff,
+                    name="sqlmesh-table-diff",
+                )
+                thread.start()
+
+                for event in generator.events(thread):
+                    match event:
+                        case console.ConsoleException(exception=exception):
+                            errors.append(exception)
+                        case _:
+                            event_handler.process_events(event)
+
+                thread.join()
+
+            if errors:
+                raise PlanOrRunFailedError(
+                    "table_diff",
+                    f"sqlmesh failed during table diff with {len(errors)} errors",
+                    errors,
+                )
+
+            return diffs
 
     def create_event_handler(
         self,

@@ -1,13 +1,17 @@
+import logging
 import typing as t
 from dataclasses import dataclass
 
 import dagster as dg
 import pytest
+from dagster import build_asset_context
 
+from dagster_sqlmesh import console
 from dagster_sqlmesh.resource import (
     DagsterSQLMeshEventHandler,
     ModelMaterializationStatus,
     PlanOrRunFailedError,
+    TableDiffEventHandler,
 )
 from dagster_sqlmesh.testing import setup_testing_sqlmesh_test_context
 from dagster_sqlmesh.testing.context import SQLMeshTestContext, TestSQLMeshResource
@@ -241,5 +245,158 @@ def test_sqlmesh_resource_should_properly_materialize_results_when_no_plan_is_ru
                 == status.created_at.timestamp()
             ), f"{status.model_fqn} updated. Expected only full model to be updated"
             assert (
-                status.last_backfill.timestamp() == status.created_at.timestamp()
-            ), f"{status.model_fqn} run. Expected only full model to be run"
+            status.last_backfill.timestamp() == status.created_at.timestamp()
+        ), f"{status.model_fqn} run. Expected only full model to be run"
+
+
+def test_sqlmesh_resource_materializations_disabled(
+    sample_sqlmesh_resource_initialization: SQLMeshResourceInitialization,
+):
+    resource = sample_sqlmesh_resource_initialization.resource
+    dg_context = sample_sqlmesh_resource_initialization.dagster_context
+
+    results = list(
+        resource.run(
+            dg_context,
+            materializations_enabled=False,
+        )
+    )
+
+    assert results == []
+
+
+def test_sqlmesh_resource_restate_selected_forwards_select_models(
+    sample_sqlmesh_resource_initialization: SQLMeshResourceInitialization,
+    monkeypatch,
+):
+    resource = sample_sqlmesh_resource_initialization.resource
+    dg_context = sample_sqlmesh_resource_initialization.dagster_context
+
+    from dagster_sqlmesh.controller.base import SQLMeshInstance
+
+    captured: dict[str, object] = {}
+    original_plan_and_run = SQLMeshInstance.plan_and_run
+
+    def tracking_plan_and_run(self: SQLMeshInstance, *args, **kwargs):
+        plan_options = kwargs.get("plan_options")
+        run_options = kwargs.get("run_options")
+
+        try:
+            yield from original_plan_and_run(self, *args, **kwargs)
+        finally:
+            captured["plan_options"] = dict(plan_options or {})
+            captured["run_options"] = dict(run_options or {})
+            captured["select_models"] = kwargs.get("select_models")
+            captured["restate_models"] = kwargs.get("restate_models")
+            captured["restate_selected"] = kwargs.get("restate_selected")
+
+    monkeypatch.setattr(SQLMeshInstance, "plan_and_run", tracking_plan_and_run)
+
+    list(resource.run(dg_context))
+
+    def fake_get_selected_models_from_context(context, models):
+        items = list(models.items())
+        key, model = items[0]
+        return ({key}, {key: model}, [model.name])
+
+    monkeypatch.setattr(
+        resource,
+        "_get_selected_models_from_context",
+        fake_get_selected_models_from_context,
+    )
+
+    list(
+        resource.run(
+            dg_context,
+            restate_selected=True,
+        )
+    )
+
+    select_models = captured["select_models"]
+    assert select_models is not None and len(select_models) == 1
+    assert captured["restate_models"] in (None, [])
+    assert captured["restate_selected"] is True
+
+    plan_options = captured["plan_options"]
+    run_options = captured["run_options"]
+
+    assert plan_options.get("restate_models") in (None, select_models)
+    assert run_options.get("select_models") in (None, select_models)
+
+
+def test_sqlmesh_resource_table_diff(
+    sample_sqlmesh_resource_initialization: SQLMeshResourceInitialization,
+):
+    resource = sample_sqlmesh_resource_initialization.resource
+    dg_context = sample_sqlmesh_resource_initialization.dagster_context
+
+    # Prime environment so both source and target exist
+    list(resource.run(dg_context))
+
+    diffs = resource.table_diff(
+        dg_context,
+        source="sqlmesh_example.staging_model_3",
+        target="sqlmesh_example.staging_model_3",
+        on=["id"],
+        show=False,
+        skip_grain_check=True,
+    )
+
+    assert isinstance(diffs, list)
+    assert len(diffs) == 1
+
+
+def test_sqlmesh_resource_table_diff_requires_join_keys(
+    sample_sqlmesh_resource_initialization: SQLMeshResourceInitialization,
+):
+    resource = sample_sqlmesh_resource_initialization.resource
+    dg_context = sample_sqlmesh_resource_initialization.dagster_context
+
+    list(resource.run(dg_context))
+
+    with pytest.raises(PlanOrRunFailedError):
+        resource.table_diff(
+            dg_context,
+            source="sqlmesh_example.full_model",
+            target="sqlmesh_example.full_model",
+            show=False,
+        )
+
+
+def test_table_diff_event_handler_emits_logs():
+    class DummyLog:
+        def __init__(self) -> None:
+            self.messages: list[tuple[str, dict[str, t.Any] | None]] = []
+
+        def info(self, message: str, extra: dict[str, t.Any] | None = None) -> None:
+            self.messages.append((message, extra))
+
+        def warning(self, *args: t.Any, **kwargs: t.Any) -> None:
+            self.messages.append(("warning", None))
+
+    class DummyContext:
+        def __init__(self) -> None:
+            self.log = DummyLog()
+
+    handler = TableDiffEventHandler(DummyContext())
+
+    class DummyDiff:
+        model_name = "sqlmesh_example.staging_model_3"
+        source_schema = "sqlmesh_example.staging_model_3"
+        target_schema = "sqlmesh_example.staging_model_3"
+        row_diff = "row diff"
+        schema_diff = "schema diff"
+
+    event = console.ShowTableDiff(
+        table_diffs=[DummyDiff()],
+        show_sample=True,
+        skip_grain_check=False,
+        temp_schema=None,
+    )
+
+    handler.process_events(event)
+
+    message, payload = handler._context.log.messages[-1]
+    assert message == "SQLMesh table diff results"
+    assert payload is not None
+    assert payload["models"] == [DummyDiff.model_name]
